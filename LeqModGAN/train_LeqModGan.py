@@ -1,0 +1,123 @@
+import os
+import argparse
+import json
+import torch.utils.data
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+import torch.backends.cudnn as cudnn
+from CustomDataSet import TrainSet
+from model_LeqModGan import modelGAN
+import csv
+import numpy as np
+import random
+import pickle
+from pathlib import Path
+
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+os.environ['CUDA_VISIBLE_DEVICES'] = "1,0"
+parser = argparse.ArgumentParser(description='PETdenoise')
+parser.add_argument('--output_path', type=str, default=' /')
+parser.add_argument('--experiment_name', type=str, default='PETdenoise/')
+parser.add_argument('--resume', type=str, default=None) # resume from a weight
+parser.add_argument('--preWeight', type=str, default=' ') # load pre weight
+parser.add_argument('--num_workers', type=int, default=8, help='number of threads to load data')
+parser.add_argument('--lr', type=float, default=1e-4, help='initial learning rate')
+
+parser.add_argument('--weightLoss_mse', type=float, default=10.0, help='loss weight for L_base')
+parser.add_argument('--weightLoss_localSUVbias', default=2.0, help='loss weight for L_qu')
+parser.add_argument('--adaptSampleByLesion', default=True)
+parser.add_argument('--weightLoss_lesionSUVbias', default=2.0, help='loss weight for L_le')
+parser.add_argument('--segProbThresh', type=float, default=0.2) # minimum lesion probability
+
+parser.add_argument('--batch_size', type=int, default=2, help='training batch size')
+parser.add_argument('--SamplePatchNumPerImage', type=int, default=40, help='select partial patches')
+parser.add_argument('--patch_size', nargs='+', type=int, default=[80, 80, 80], help='patch size')
+parser.add_argument('--stride_size', nargs='+', type=int, default=[20, 20, 20])
+parser.add_argument('--validValueThresh', type=float, default=0.2, help='suv valid value')
+parser.add_argument('--AUG', default=True, action='store_true', help='use augmentation')
+parser.add_argument('--rotate_train', type=int, default=10, help='randomly rotate patch along z for train')
+parser.add_argument('--saveModel_epochs', type=int, default=1, help='save model for every number of epochs')
+parser.add_argument('--saveLoss_epochs', type=int, default=1, help='save loss info for every number of epochs')
+parser.add_argument('--n_epochs', type=int, default=500, help='max number of epoch')
+parser.add_argument('--lr_policy', type=str, default='ReduceLROnPlateau', help='ReduceLROnPlateau/multistep/cosine/')
+parser.add_argument('--gamma', type=float, default=0.1, help='decay ratio for step scheduler')
+parser.add_argument('--Plateau_step_size', type=int, default=10, help='step size for scheduler')
+opts = parser.parse_args()
+# =========denoise dataset path===============================================================================
+imgPath = []
+for file in Path('/00._datasetDenoise/').rglob('*_100.nii.gz'):
+    imgPath.append(str(file))
+print('subjects : ', len(imgPath))
+
+opts.pathAll = []
+for doseIdx, Idx in zip(['1','2','5','10','25','50'], [5, 4, 3, 2, 1, 1]): # ========noise-adaptive sample==============
+    for cycleIdx in range(Idx):
+        opts.pathAll += [pathC.replace('_100.nii.gz', '_'+doseIdx+'.nii.gz') for pathC in (imgPath)]
+opts.pathAll = [pathC for pathC in opts.pathAll if os .path.exists(pathC)]
+print('pairs total: ', len(opts.pathAll))
+# ====================================================================================================================
+options_str = json.dumps(opts.__dict__, indent=4, sort_keys=False)
+cudnn.benchmark = True
+opts.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+opts.numGPUs = torch.cuda.device_count()
+print('using', opts.device)
+print('num of available GPUs', opts.numGPUs)
+
+model = modelGAN(opts)
+if opts.resume is None:
+    model.initialize()
+    ep0 = -1
+    total_iter = 0
+else:
+    ep0, total_iter = model.resume(opts.resume)
+
+model.set_scheduler(opts, ep0)
+ep0 += 1
+print('Start training at epoch {} \n'.format(ep0))
+
+train_set = TrainSet(opts)
+train_loader = DataLoader(dataset=train_set, num_workers=opts.num_workers, batch_size=opts.batch_size, shuffle=True, pin_memory=True)
+
+output_directory = os.path.join(opts.output_path, opts.experiment_name)
+checkpoint_directory = os.path.join(output_directory, 'checkpoints')
+if not os.path.exists(checkpoint_directory):
+    print("Creating directory: {}".format(checkpoint_directory))
+    os.makedirs(checkpoint_directory)
+
+with open(os.path.join(output_directory, 'options.json'), 'w') as f:
+    f.write(options_str)
+
+with open(os.path.join(output_directory, 'train_loss.csv'), 'w') as f:
+    writer = csv.writer(f)
+    writer.writerow(model.loss_names)
+
+# ======================================training loop===============================================
+for epoch in range(ep0, opts.n_epochs + 1):
+    epochLoss = []
+
+    train_bar = tqdm(train_loader)
+    model.train()
+    model.set_epoch(epoch)
+    for it, data in enumerate(train_bar):
+        total_iter += 1
+        model.set_input(data)
+        model.optimize(total_iter)
+        train_bar.set_description(desc='[Epoch {}]'.format(epoch) + model.loss_summary())
+        epochLoss.append(list(model.get_current_losses().values()))
+    
+    epochLossAll = np.mean(np.array(epochLoss), axis=0)
+    current_lr = model.update_learning_rate(epochLossAll[2::].mean()) # adjust learning rate according to generator loss
+    
+    if (epoch+1) % opts.saveLoss_epochs == 0: # write loss info
+        with open(os.path.join(output_directory, 'train_loss.csv'), 'a') as f:
+            writer = csv.writer(f)
+            writer.writerow(np.mean(np.array(epochLoss), axis=0))
+
+    if (epoch+1) % opts.saveModel_epochs == 0: # save checkpoint
+        print('Saving checkpoint ......')
+        checkpoint_name = os.path.join(checkpoint_directory, 'model_{}.pt'.format(epoch))
+        model.save(checkpoint_name, epoch, total_iter)
+    
+    if current_lr < 1e-7:
+        print('Terminating training. Learning rate below threshold.')
+        break
