@@ -1,2 +1,2 @@
 # LeqMod_PET_denoising
-Code will be available as soon as our paper accepted.
+Code for paper 'LeqMod: Adaptable Lesion-Quantification-Consistent Modulation for Deep Learning Low-Count PET Image Denoising'.
